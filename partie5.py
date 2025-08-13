@@ -10,6 +10,8 @@ import sys
 import threading
 import time
 import uuid
+import os
+import sqlite3
 from datetime import datetime
 from typing import Dict, List, Optional
 
@@ -50,6 +52,8 @@ except Exception:
                 "mode_debug": False,
                 "seuil_confiance_minimum": 0.3,
                 "taille_max_memoire_court_terme": 100,
+                "api_keys": [],
+                "db_path": "ia_system.db",
             }
 
         def charger(self, chemin: str) -> None:
@@ -75,36 +79,45 @@ except Exception:
         def execute(self, query: str, params: tuple = ()) -> "_InMemoryCursor":
             q = query.strip().lower()
             if q.startswith("select count(*) from symboles"):
-                self._last_result = [(self._db.counts.get("symboles", 0),)]
+                self._last_result = [(self._db._count_table("symboles"),)]
             elif q.startswith("select count(*) from relations"):
-                self._last_result = [(self._db.counts.get("relations", 0),)]
+                self._last_result = [(self._db._count_table("relations"),)]
             elif q.startswith("select count(*) from regles_logiques"):
-                self._last_result = [(self._db.counts.get("regles_logiques", 0),)]
+                self._last_result = [(self._db._count_table("regles_logiques"),)]
             elif q.startswith("select count(*) from memoire_a_court_terme"):
-                self._last_result = [(0,)]
+                # For backward compatibility when using SQLite-based fallback
+                try:
+                    cur = self._db.connexion.cursor()
+                    cur.execute("SELECT COUNT(*) FROM memoire_a_court_terme WHERE session_id = ?", params)
+                    self._last_result = [cur.fetchone()]
+                except Exception:
+                    self._last_result = [(0,)]
             elif q.startswith("select type, count(*) from symboles group by type"):
-                self._last_result = [(t, c) for t, c in self._db.symboles_par_type.items()]
+                cur = self._db.connexion.cursor()
+                cur.execute("SELECT type, COUNT(*) FROM symboles GROUP BY type")
+                self._last_result = cur.fetchall()
             elif q.startswith("select type_relation, count(*) from relations group by type_relation"):
-                self._last_result = [(t, c) for t, c in self._db.relations_par_type.items()]
+                cur = self._db.connexion.cursor()
+                cur.execute("SELECT type_relation, COUNT(*) FROM relations GROUP BY type_relation")
+                self._last_result = cur.fetchall()
             elif q.startswith("insert into feedback"):
                 try:
                     session_id, requete, reponse, evaluation = params
                 except Exception:
                     session_id, requete, reponse, evaluation = (None, None, None, None)
-                self._db.feedback.append(
-                    {
-                        "session_id": session_id,
-                        "requete": requete,
-                        "reponse": reponse,
-                        "evaluation": evaluation,
-                        "timestamp": datetime.now(),
-                    }
+                cur = self._db.connexion.cursor()
+                cur.execute(
+                    "INSERT INTO feedback (session_id, requete, reponse, evaluation, timestamp) VALUES (?, ?, ?, ?, ?)",
+                    (session_id, requete, reponse, evaluation, datetime.now().isoformat()),
                 )
+                self._db.connexion.commit()
                 self._last_result = None
             elif q.startswith("delete from memoire_a_court_terme"):
+                cur = self._db.connexion.cursor()
+                cur.execute("DELETE FROM memoire_a_court_terme WHERE session_id = ?", params)
+                self._db.connexion.commit()
                 self._last_result = None
             else:
-                # Requête inconnue, renvoyer vide par défaut
                 self._last_result = []
             return self
 
@@ -130,15 +143,48 @@ except Exception:
             return None
 
         def close(self) -> None:
-            return None
+            try:
+                self._db.connexion.close()
+            except Exception:
+                pass
 
     class BaseDonneesCentrale:
-        def __init__(self) -> None:
-            self.connexion = _InMemoryConnection(self)
-            self.counts: Dict[str, int] = {"symboles": 0, "relations": 0, "regles_logiques": 0}
-            self.symboles_par_type: Dict[str, int] = {}
-            self.relations_par_type: Dict[str, int] = {}
-            self.feedback: List[Dict[str, object]] = []
+        def __init__(self, db_path: Optional[str] = None) -> None:
+            chemin_db = db_path or os.getenv("IA_DB_PATH") or "ia_system.db"
+            self.connexion = sqlite3.connect(chemin_db, check_same_thread=False)
+            self.connexion.execute("PRAGMA journal_mode=WAL;")
+            self._creer_schema()
+
+        def _creer_schema(self) -> None:
+            cur = self.connexion.cursor()
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS symboles (id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT, valeur TEXT)"
+            )
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS relations (id INTEGER PRIMARY KEY AUTOINCREMENT, type_relation TEXT, source TEXT, cible TEXT)"
+            )
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS regles_logiques (id INTEGER PRIMARY KEY AUTOINCREMENT, regle TEXT)"
+            )
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS memoire_a_court_terme (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, cle TEXT, valeur TEXT, timestamp TEXT)"
+            )
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS feedback (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, requete TEXT, reponse TEXT, evaluation INTEGER, timestamp TEXT)"
+            )
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS journal_requetes (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, question TEXT, duree REAL, confiance REAL, methode TEXT, emotion TEXT, timestamp TEXT)"
+            )
+            self.connexion.commit()
+
+        def _count_table(self, table: str) -> int:
+            try:
+                cur = self.connexion.cursor()
+                cur.execute(f"SELECT COUNT(*) FROM {table}")
+                row = cur.fetchone()
+                return int(row[0]) if row else 0
+            except Exception:
+                return 0
 
         def fermer(self) -> None:
             self.connexion.close()
@@ -199,14 +245,40 @@ except Exception:
             self.emotions = emotions
 
         def traiter_requete_complete(self, question: str) -> Dict[str, object]:
-            # Heuristique triviale pour démo
-            confiance = 0.75 if question else 0.0
-            emotion_detectee = "neutre"
-            if any(mot in question.lower() for mot in ["triste", "mal", "peur", "anxieux"]):
-                emotion_detectee = "empathique"
-            self.emotions.set_emotion("curieux")
+            q = (question or "").strip()
+            if not q:
+                confiance = 0.0
+            else:
+                longueur = len(q)
+                confiance = min(0.9, 0.55 + min(0.25, longueur / 200.0))
+
+            q_lower = q.lower()
+            lexique = {
+                "joyeux": ["heureux", "content", "joyeux", "satisfait", "ravi", "super", "génial"],
+                "triste": ["triste", "mal", "déprimé", "déprime", "chagrin", "pleurer", "peiné"],
+                "colère": ["colère", "fâché", "énervé", "furieux", "rage"],
+                "anxieux": ["peur", "anxieux", "anxieuse", "stressé", "stress", "angoissé", "inquiet", "inquiète"],
+            }
+            amorces_question = ["pourquoi", "comment", "quand", "qui", "où", "ou", "combien", "?", "qu'est-ce", "quel"]
+
+            scores = {"joyeux": 0, "triste": 0, "colère": 0, "anxieux": 0, "curieux": 0}
+            if any(a in q_lower for a in amorces_question):
+                scores["curieux"] += 2
+            for emo, mots in lexique.items():
+                for m in mots:
+                    if m in q_lower:
+                        scores[emo] += 1
+
+            # Choisir l'émotion dominante
+            emotion_detectee = max(scores.keys(), key=lambda k: scores[k])
+            if scores[emotion_detectee] == 0:
+                emotion_detectee = "neutre"
+
+            # Mettre à jour l'état émotionnel (simple stratégie)
+            self.emotions.set_emotion(emotion_detectee if emotion_detectee != "neutre" else "curieux")
+
             return {
-                "question": question,
+                "question": q,
                 "confiance": confiance,
                 "emotion_detectee": emotion_detectee,
                 "analyse_symbolique": {"concepts": [], "relations": []},
@@ -562,7 +634,18 @@ class InterfaceAPI:
         self.systeme = systeme_ia
         self.port = port
         self.app = Flask(__name__)
-        self.cles_api_valides = set()  # Pour authentification future
+        # Charger clés depuis la config et l'environnement
+        cles_cfg = self.systeme.config.obtenir("api_keys", [])
+        if isinstance(cles_cfg, str):
+            cles = [c.strip() for c in cles_cfg.split(",") if c.strip()]
+        elif isinstance(cles_cfg, list):
+            cles = [str(c) for c in cles_cfg if str(c).strip()]
+        else:
+            cles = []
+        env_keys = os.getenv("API_KEYS", "")
+        if env_keys:
+            cles += [c.strip() for c in env_keys.split(",") if c.strip()]
+        self.cles_api_valides = set(cles)
         self.configurer_api()
 
     def configurer_api(self) -> None:
@@ -571,13 +654,32 @@ class InterfaceAPI:
         @self.app.after_request
         def after_request(response):  # type: ignore[override]
             response.headers.add("Access-Control-Allow-Origin", "*")
-            response.headers.add("Access-Control-Allow-Headers", "Content-Type,Authorization")
+            response.headers.add("Access-Control-Allow-Headers", "Content-Type,Authorization,X-API-Key")
             response.headers.add("Access-Control-Allow-Methods", "GET,PUT,POST,DELETE")
             return response
+
+        def verifier_api_key():
+            cle = request.headers.get("X-API-Key") or request.args.get("api_key")
+            if not self.cles_api_valides:
+                return jsonify({
+                    "success": False,
+                    "error": "API key requise. Configurez 'api_keys' dans config.json ou la variable d'environnement API_KEYS.",
+                    "code": "API_KEY_REQUIRED",
+                }), 401
+            if cle not in self.cles_api_valides:
+                return jsonify({
+                    "success": False,
+                    "error": "Clé d'API invalide",
+                    "code": "API_KEY_INVALID",
+                }), 401
+            return None
 
         @self.app.route("/api/v1/question", methods=["POST"])
         def api_question():
             """Endpoint principal pour poser une question"""
+            auth = verifier_api_key()
+            if auth is not None:
+                return auth
             try:
                 data = request.get_json()
                 question = (data.get("question", "") if isinstance(data, dict) else "").strip()
@@ -618,6 +720,9 @@ class InterfaceAPI:
         @self.app.route("/api/v1/status", methods=["GET"])
         def api_status():
             """État complet du système"""
+            auth = verifier_api_key()
+            if auth is not None:
+                return auth
             try:
                 status = self.systeme.obtenir_status_complet()
                 return jsonify({"success": True, "status": status, "timestamp": datetime.now().isoformat()})
@@ -627,6 +732,9 @@ class InterfaceAPI:
         @self.app.route("/api/v1/session/nouvelle", methods=["POST"])
         def api_nouvelle_session():
             """Crée une nouvelle session"""
+            auth = verifier_api_key()
+            if auth is not None:
+                return auth
             try:
                 session_id = self.systeme.moteur_inference.contexte.nouvelle_session()
                 return jsonify({"success": True, "session_id": session_id})
@@ -636,6 +744,9 @@ class InterfaceAPI:
         @self.app.route("/api/v1/apprentissage/feedback", methods=["POST"])
         def api_feedback():
             """Enregistre un feedback pour l'apprentissage"""
+            auth = verifier_api_key()
+            if auth is not None:
+                return auth
             try:
                 data = request.get_json()
                 question = (data.get("question", "") if isinstance(data, dict) else "").strip()
@@ -644,14 +755,15 @@ class InterfaceAPI:
                 cursor = self.systeme.db.connexion.cursor()
                 cursor.execute(
                     """
-INSERT INTO feedback (session_id, requete, reponse, evaluation)
-VALUES (?, ?, ?, ?)
+INSERT INTO feedback (session_id, requete, reponse, evaluation, timestamp)
+VALUES (?, ?, ?, ?, ?)
 """,
                     (
                         self.systeme.moteur_inference.contexte.session_actuelle,
                         question,
                         reponse,
                         evaluation,
+                        datetime.now().isoformat(),
                     ),
                 )
                 self.systeme.db.connexion.commit()
@@ -662,6 +774,7 @@ VALUES (?, ?, ?, ?)
         @self.app.route("/api/v1/documentation", methods=["GET"])
         def api_documentation():
             """Documentation de l'API"""
+            # La documentation ne nécessite pas d'API key
             doc = {
                 "nom": "API IA Auto-Régénérante",
                 "version": "1.0",
@@ -675,10 +788,11 @@ VALUES (?, ?, ?, ?)
                                 "format": "string (optionnel: 'standard' ou 'markdown')",
                             },
                         },
+                        "auth": "Header X-API-Key requis",
                     },
-                    "GET /api/v1/status": "État du système",
-                    "POST /api/v1/session/nouvelle": "Crée une nouvelle session",
-                    "POST /api/v1/apprentissage/feedback": "Enregistre un feedback",
+                    "GET /api/v1/status": "État du système (X-API-Key)",
+                    "POST /api/v1/session/nouvelle": "Crée une nouvelle session (X-API-Key)",
+                    "POST /api/v1/apprentissage/feedback": "Enregistre un feedback (X-API-Key)",
                 },
             }
             return jsonify(doc)
@@ -723,6 +837,24 @@ class SystemeIAComplet:
         reponse_data["duree_traitement"] = duree
         reponse_data["timestamp"] = datetime.now().isoformat()
         reponse_data["emotion_detectee"] = resultat_cognitif.get("emotion_detectee", "neutre")
+        # Journaliser la requête dans la base
+        try:
+            cur = self.db.connexion.cursor()
+            cur.execute(
+                "INSERT INTO journal_requetes (session_id, question, duree, confiance, methode, emotion, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    self.contexte.session_actuelle,
+                    question,
+                    float(duree),
+                    float(reponse_data.get("confiance_finale", 0)),
+                    str(reponse_data.get("methode_utilisee", "symbolique")),
+                    str(reponse_data.get("emotion_detectee", "neutre")),
+                    reponse_data["timestamp"],
+                ),
+            )
+            self.db.connexion.commit()
+        except Exception:
+            pass
         return reponse_data
 
     def obtenir_status_complet(self) -> Dict[str, object]:
